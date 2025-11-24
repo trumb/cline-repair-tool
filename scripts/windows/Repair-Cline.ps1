@@ -5,13 +5,22 @@
 .DESCRIPTION
     This script performs a complete repair of the Cline VS Code extension by:
     1. Backing up all user data (tasks, history, MCP settings, rules, workflows)
-    2. Uninstalling the current Cline extension
-    3. Performing a clean reinstallation
-    4. Restoring all user data
-    5. Configuring the sidebar position to left (Primary Side Bar)
+    2. Compressing backups to ZIP format with SHA256 hash verification
+    3. Uninstalling the current Cline extension
+    4. Performing a clean reinstallation
+    5. Restoring all user data
+    6. Configuring the sidebar position to left (Primary Side Bar)
     
     The script requires Administrator privileges to ensure complete access to all
     VS Code directories and proper extension management.
+    
+    Enhanced Features:
+    - 367 backup retention (daily backups for a year)
+    - UTC timestamps with hour/minute/second precision
+    - ZIP compression with integrity verification
+    - SHA256 hash in filename for backup verification
+    - JSON input/output support for automation
+    - Automatic verification of existing backups on startup
     
 .PARAMETER BackupOnly
     Only perform backup without uninstall/reinstall. Useful for creating regular backups.
@@ -21,6 +30,21 @@
     
 .PARAMETER BackupPath
     Custom path for backup storage. Default: $env:USERPROFILE\ClineBackups
+    
+.PARAMETER MaxBackups
+    Maximum number of backups to retain. Default: 367 (one year of daily backups)
+    
+.PARAMETER NoCompress
+    Skip ZIP compression and store backups as directories.
+    
+.PARAMETER HashAlgorithm
+    Hash algorithm to use for backup verification. Options: SHA256 (default), SHA1, MD5
+    
+.PARAMETER JsonOutput
+    Output results in JSON format for automation and piping.
+    
+.PARAMETER JsonInput
+    JSON string containing configuration parameters.
     
 .PARAMETER UseGitHubBackup
     Upload backup to a private GitHub repository for safe cloud storage.
@@ -33,20 +57,25 @@
     
 .EXAMPLE
     .\Repair-Cline.ps1
-    Performs a complete repair with default settings.
+    Performs a complete repair with default settings (367 backups, ZIP compression, SHA256).
     
 .EXAMPLE
-    .\Repair-Cline.ps1 -BackupOnly
-    Only creates a backup without performing repair.
+    .\Repair-Cline.ps1 -BackupOnly -MaxBackups 30
+    Only creates a backup and keeps last 30 backups.
     
 .EXAMPLE
-    .\Repair-Cline.ps1 -UseGitHubBackup -GitHubToken "ghp_xxxxxxxxxxxx"
-    Performs repair and uploads backup to GitHub.
+    .\Repair-Cline.ps1 -JsonOutput
+    Performs repair and outputs results in JSON format.
+    
+.EXAMPLE
+    echo '{"BackupOnly":true,"MaxBackups":10}' | .\Repair-Cline.ps1 -JsonInput
+    Uses piped JSON input for configuration.
     
 .NOTES
-    Version: 1.0.0
+    Version: 2.0.0
     Author: Cline Repair Tool
     Created: 2025-11-24
+    Updated: 2025-11-24
     Requires: Administrator privileges, VS Code installed
 #>
 
@@ -60,6 +89,22 @@ param(
     
     [Parameter(Mandatory=$false)]
     [string]$BackupPath = "$env:USERPROFILE\ClineBackups",
+    
+    [Parameter(Mandatory=$false)]
+    [int]$MaxBackups = 367,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$NoCompress,
+    
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("SHA256", "SHA1", "MD5")]
+    [string]$HashAlgorithm = "SHA256",
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$JsonOutput,
+    
+    [Parameter(Mandatory=$false, ValueFromPipeline=$true)]
+    [string]$JsonInput,
     
     [Parameter(Mandatory=$false)]
     [switch]$UseGitHubBackup,
@@ -76,11 +121,37 @@ param(
 # ============================================================================
 
 $ErrorActionPreference = "Stop"
-$script:strScriptVersion = "1.0.0"
-$script:strTimestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$script:strScriptVersion = "2.0.0"
+
+# Process JSON input if provided
+if ($JsonInput) {
+    try {
+        $objJsonConfig = $JsonInput | ConvertFrom-Json
+        
+        # Override parameters from JSON
+        if ($objJsonConfig.BackupOnly) { $BackupOnly = $true }
+        if ($objJsonConfig.SkipBackup) { $SkipBackup = $true }
+        if ($objJsonConfig.BackupPath) { $BackupPath = $objJsonConfig.BackupPath }
+        if ($objJsonConfig.MaxBackups) { $MaxBackups = $objJsonConfig.MaxBackups }
+        if ($objJsonConfig.NoCompress) { $NoCompress = $true }
+        if ($objJsonConfig.HashAlgorithm) { $HashAlgorithm = $objJsonConfig.HashAlgorithm }
+        if ($objJsonConfig.JsonOutput) { $JsonOutput = $true }
+        if ($objJsonConfig.VerboseLogging) { $VerboseLogging = $true }
+        if ($objJsonConfig.UseGitHubBackup) { $UseGitHubBackup = $true }
+        if ($objJsonConfig.GitHubToken) { $GitHubToken = $objJsonConfig.GitHubToken }
+    }
+    catch {
+        Write-Error "Failed to parse JSON input: $($_.Exception.Message)"
+        exit 1
+    }
+}
+
+# Generate UTC timestamp with hour/minute/second precision
+$dtNowUtc = (Get-Date).ToUniversalTime()
+$script:strTimestamp = $dtNowUtc.ToString("yyyyMMdd_HHmmss") + "_UTC"
 $script:strLogFileName = "cline-repair-$script:strTimestamp.log"
 $script:strLogFilePath = Join-Path $BackupPath $script:strLogFileName
-$script:intMaxBackups = 5
+$script:intMaxBackups = $MaxBackups
 
 # VS Code and Cline extension identifiers
 $script:strClineExtensionId = "saoudrizwan.claude-dev"
@@ -92,6 +163,23 @@ $script:strVSCodeExtensions = Join-Path $strUserProfile ".vscode\extensions"
 $script:strVSCodeUserData = Join-Path $env:APPDATA "Code\User"
 $script:strClineGlobalStorage = Join-Path $strVSCodeUserData "globalStorage\saoudrizwan.claude-dev"
 $script:strClineDocuments = Join-Path $strUserProfile "Documents\Cline"
+
+# JSON output object
+$script:objJsonResult = @{
+    version = $script:strScriptVersion
+    timestamp = $script:strTimestamp
+    platform = "Windows"
+    status = "in_progress"
+    backupPath = ""
+    backupSize = 0
+    itemsBackedUp = 0
+    hashes = @{
+        sha1 = ""
+        md5 = ""
+        sha256 = ""
+    }
+    errors = @()
+}
 
 # ============================================================================
 # LOGGING FUNCTIONS
@@ -119,8 +207,8 @@ function Write-Log {
     # Write to log file
     Add-Content -Path $script:strLogFilePath -Value $strLogEntry -Encoding UTF8
     
-    # Write to console based on level and verbose setting
-    if ($VerboseLogging -or $strLevel -in @("SUCCESS", "WARNING", "ERROR")) {
+    # Write to console based on level and verbose setting (only if not JSON output)
+    if (-not $JsonOutput -and ($VerboseLogging -or $strLevel -in @("SUCCESS", "WARNING", "ERROR"))) {
         $objColor = switch ($strLevel) {
             "SUCCESS" { "Green" }
             "WARNING" { "Yellow" }
@@ -130,6 +218,11 @@ function Write-Log {
             default   { "White" }
         }
         Write-Host $strLogEntry -ForegroundColor $objColor
+    }
+    
+    # Track errors for JSON output
+    if ($strLevel -eq "ERROR") {
+        $script:objJsonResult.errors += $strMessage
     }
 }
 
@@ -141,6 +234,115 @@ function Write-LogHeader {
     Write-Log -strMessage $strSeparator -strLevel "INFO"
     Write-Log -strMessage $strTitle -strLevel "INFO"
     Write-Log -strMessage $strSeparator -strLevel "INFO"
+}
+
+# ============================================================================
+# HASH CALCULATION FUNCTIONS
+# ============================================================================
+
+function Get-FileHashValue {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$strFilePath,
+        
+        [Parameter(Mandatory=$false)]
+        [ValidateSet("SHA256", "SHA1", "MD5")]
+        [string]$strAlgorithm = "SHA256"
+    )
+    
+    try {
+        $objHash = Get-FileHash -Path $strFilePath -Algorithm $strAlgorithm
+        return $objHash.Hash
+    }
+    catch {
+        Write-Log -strMessage "Error calculating $strAlgorithm hash: $($_.Exception.Message)" -strLevel "ERROR"
+        return ""
+    }
+}
+
+function Get-ShortHash {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$strFullHash
+    )
+    
+    # Return first 8 characters of hash
+    return $strFullHash.Substring(0, [Math]::Min(8, $strFullHash.Length))
+}
+
+function Test-BackupIntegrity {
+    param([Parameter(Mandatory=$true)][string]$strZipPath)
+    
+    Write-Log -strMessage "Verifying backup integrity for $(Split-Path -Leaf $strZipPath)" -strLevel "INFO"
+    
+    # Extract hash from filename (format: backup_YYYYMMDD_HHMMSS_UTC_{8-char-hash}.zip)
+    $strFileName = [System.IO.Path]::GetFileNameWithoutExtension($strZipPath)
+    
+    if ($strFileName -match '_([A-Fa-f0-9]{8})$') {
+        $strExpectedHash = $matches[1]
+        
+        # Calculate actual hash
+        $strFullHash = Get-FileHashValue -strFilePath $strZipPath -strAlgorithm $HashAlgorithm
+        $strActualHash = Get-ShortHash -strFullHash $strFullHash
+        
+        if ($strActualHash -eq $strExpectedHash) {
+            Write-Log -strMessage "✓ Integrity verified: $strFileName" -strLevel "SUCCESS"
+            return $true
+        }
+        else {
+            Write-Log -strMessage "✗ Integrity check FAILED: $strFileName (expected: $strExpectedHash, got: $strActualHash)" -strLevel "WARNING"
+            return $false
+        }
+    }
+    else {
+        Write-Log -strMessage "No hash found in filename: $strFileName (legacy backup format)" -strLevel "INFO"
+        return $null  # Unknown - legacy format
+    }
+}
+
+function Invoke-BackupIntegrityCheck {
+    Write-LogHeader -strTitle "VERIFYING EXISTING BACKUPS"
+    
+    Write-Log -strMessage "Checking integrity of existing backup files" -strLevel "ACTION"
+    Write-Log -strMessage "Ensures all backups are uncorrupted and can be restored if needed" -strLevel "REASON"
+    
+    try {
+        $arrZipFiles = Get-ChildItem -Path $BackupPath -Filter "backup_*_UTC_*.zip" -ErrorAction SilentlyContinue
+        
+        if (-not $arrZipFiles -or $arrZipFiles.Count -eq 0) {
+            Write-Log -strMessage "No existing backups found to verify" -strLevel "INFO"
+            return
+        }
+        
+        Write-Log -strMessage "Found $($arrZipFiles.Count) backup(s) to verify" -strLevel "INFO"
+        
+        $intVerified = 0
+        $intFailed = 0
+        $intLegacy = 0
+        
+        foreach ($objZipFile in $arrZipFiles) {
+            $objVerifyResult = Test-BackupIntegrity -strZipPath $objZipFile.FullName
+            
+            if ($objVerifyResult -eq $true) {
+                $intVerified++
+            }
+            elseif ($objVerifyResult -eq $false) {
+                $intFailed++
+            }
+            else {
+                $intLegacy++
+            }
+        }
+        
+        Write-Log -strMessage "Integrity check complete: $intVerified verified, $intFailed failed, $intLegacy legacy format" -strLevel "SUCCESS"
+        
+        if ($intFailed -gt 0) {
+            Write-Log -strMessage "WARNING: $intFailed backup(s) failed integrity check - consider removing them" -strLevel "WARNING"
+        }
+    }
+    catch {
+        Write-Log -strMessage "Error during integrity check: $($_.Exception.Message)" -strLevel "WARNING"
+    }
 }
 
 # ============================================================================
@@ -156,12 +358,15 @@ function Test-AdminPrivileges {
     
     if (-not $boolIsAdmin) {
         Write-Log -strMessage "ERROR This script requires Administrator privileges" -strLevel "ERROR"
-        Write-Host ""
-        Write-Host "Please run this script as Administrator:" -ForegroundColor Yellow
-        Write-Host "  1. Right-click on PowerShell" -ForegroundColor Cyan
-        Write-Host "  2. Select 'Run as Administrator'" -ForegroundColor Cyan
-        Write-Host "  3. Run the script again" -ForegroundColor Cyan
-        Write-Host ""
+        
+        if (-not $JsonOutput) {
+            Write-Host ""
+            Write-Host "Please run this script as Administrator:" -ForegroundColor Yellow
+            Write-Host "  1. Right-click on PowerShell" -ForegroundColor Cyan
+            Write-Host "  2. Select 'Run as Administrator'" -ForegroundColor Cyan
+            Write-Host "  3. Run the script again" -ForegroundColor Cyan
+            Write-Host ""
+        }
         return $false
     }
     
@@ -208,10 +413,13 @@ function Get-VSCodeInstallation {
     
     if (-not $objResult.installed) {
         Write-Log -strMessage "VS Code installation not found in standard locations" -strLevel "ERROR"
-        Write-Host ""
-        Write-Host "VS Code does not appear to be installed." -ForegroundColor Red
-        Write-Host "Please install VS Code from https://code.visualstudio.com/" -ForegroundColor Yellow
-        Write-Host ""
+        
+        if (-not $JsonOutput) {
+            Write-Host ""
+            Write-Host "VS Code does not appear to be installed." -ForegroundColor Red
+            Write-Host "Please install VS Code from https://code.visualstudio.com/" -ForegroundColor Yellow
+            Write-Host ""
+        }
         return $null
     }
     
@@ -225,12 +433,15 @@ function Stop-VSCodeProcesses {
     
     if ($arrProcesses) {
         Write-Log -strMessage "Found $($arrProcesses.Count) VS Code process(es) running" -strLevel "WARNING"
-        Write-Host ""
-        Write-Host "VS Code is currently running and must be closed." -ForegroundColor Yellow
-        Write-Host "Please save your work and close all VS Code windows." -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host "Press any key once VS Code is closed..." -ForegroundColor Cyan
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        
+        if (-not $JsonOutput) {
+            Write-Host ""
+            Write-Host "VS Code is currently running and must be closed." -ForegroundColor Yellow
+            Write-Host "Please save your work and close all VS Code windows." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "Press any key once VS Code is closed..." -ForegroundColor Cyan
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
         
         # Verify processes are closed
         Start-Sleep -Seconds 2
@@ -238,8 +449,11 @@ function Stop-VSCodeProcesses {
         
         if ($arrProcesses) {
             Write-Log -strMessage "VS Code processes still running" -strLevel "ERROR"
-            Write-Host ""
-            Write-Host "VS Code is still running. Please close all windows and try again." -ForegroundColor Red
+            
+            if (-not $JsonOutput) {
+                Write-Host ""
+                Write-Host "VS Code is still running. Please close all windows and try again." -ForegroundColor Red
+            }
             return $false
         }
     }
@@ -263,7 +477,7 @@ function New-BackupDirectory {
     New-Item -ItemType Directory -Path $strBackupDir -Force | Out-Null
     
     # Create subdirectories
-    $arrSubDirs = @("tasks", "settings", "rules", "workflows", "cache", "checkpoints")
+    $arrSubDirs = @("tasks", "settings", "rules", "workflows", "cache", "checkpoints", "mcp_servers")
     foreach ($strSubDir in $arrSubDirs) {
         $strPath = Join-Path $strBackupDir $strSubDir
         New-Item -ItemType Directory -Path $strPath -Force | Out-Null
@@ -476,7 +690,10 @@ function New-BackupManifest {
     $objManifest = @{
         version = $script:strScriptVersion
         timestamp = $script:strTimestamp
+        timestampUtc = $dtNowUtc.ToString("o")
         platform = "Windows"
+        hashAlgorithm = $HashAlgorithm
+        compressed = -not $NoCompress
         items = $objBackupStats.items
         totalSize = $objBackupStats.totalSize
         status = "completed"
@@ -494,40 +711,97 @@ function New-BackupManifest {
     }
 }
 
+function Compress-BackupDirectory {
+    param(
+        [Parameter(Mandatory=$true)][string]$strBackupDir,
+        [Parameter(Mandatory=$true)][hashtable]$objBackupStats
+    )
+    
+    Write-LogHeader -strTitle "COMPRESSING BACKUP"
+    
+    Write-Log -strMessage "Compressing backup directory to ZIP format" -strLevel "ACTION"
+    Write-Log -strMessage "Reduces storage space and enables integrity verification" -strLevel "REASON"
+    
+    try {
+        # Calculate hash of the directory before compression
+        $strFullHash = Get-FileHashValue -strFilePath ($strBackupDir + "\backup_manifest.json") -strAlgorithm $HashAlgorithm
+        $strShortHash = Get-ShortHash -strFullHash $strFullHash
+        
+        # Create ZIP filename with hash
+        $strZipFileName = "backup_$($script:strTimestamp)_$strShortHash.zip"
+        $strZipPath = Join-Path $BackupPath $strZipFileName
+        
+        Write-Log -strMessage "Creating ZIP file: $strZipFileName" -strLevel "INFO"
+        
+        # Compress using .NET compression
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($strBackupDir, $strZipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+        
+        # Get ZIP file size
+        $intZipSize = (Get-Item $strZipPath).Length
+        $floatCompressionRatio = [math]::Round(($intZipSize / $objBackupStats.totalSize) * 100, 2)
+        
+        Write-Log -strMessage "Backup compressed successfully" -strLevel "SUCCESS"
+        Write-Log -strMessage "Original size: $([math]::Round($objBackupStats.totalSize / 1MB, 2)) MB" -strLevel "INFO"
+        Write-Log -strMessage "Compressed size: $([math]::Round($intZipSize / 1MB, 2)) MB ($floatCompressionRatio% of original)" -strLevel "INFO"
+        Write-Log -strMessage "Hash: $strFullHash" -strLevel "INFO"
+        
+        # Calculate all hash types for JSON output
+        $script:objJsonResult.hashes.sha256 = Get-FileHashValue -strFilePath $strZipPath -strAlgorithm "SHA256"
+        $script:objJsonResult.hashes.sha1 = Get-FileHashValue -strFilePath $strZipPath -strAlgorithm "SHA1"
+        $script:objJsonResult.hashes.md5 = Get-FileHashValue -strFilePath $strZipPath -strAlgorithm "MD5"
+        $script:objJsonResult.backupSize = $intZipSize
+        
+        # Remove uncompressed directory
+        Write-Log -strMessage "Removing uncompressed backup directory" -strLevel "INFO"
+        Remove-Item -Path $strBackupDir -Recurse -Force -ErrorAction Stop
+        
+        return $strZipPath
+    }
+    catch {
+        Write-Log -strMessage "Error during compression: $($_.Exception.Message)" -strLevel "ERROR"
+        return $strBackupDir  # Return original directory if compression failed
+    }
+}
+
 function Remove-OldBackups {
     param(
         [Parameter(Mandatory=$true)][string]$strBackupBasePath,
-        [Parameter(Mandatory=$false)][int]$intMaxBackups = 5
+        [Parameter(Mandatory=$false)][int]$intMaxBackups = 367
     )
     
     Write-LogHeader -strTitle "MANAGING BACKUP RETENTION"
     
-    Write-Log -strMessage "Checking for old backups to remove" -strLevel "INFO"
-    Write-Log -strMessage "Keeping only the $intMaxBackups most recent backups to conserve disk space" -strLevel "REASON"
+    Write-Log -strMessage "Checking for old backups to remove (keeping $intMaxBackups most recent)" -strLevel "INFO"
+    Write-Log -strMessage "Maintaining backup history while conserving disk space" -strLevel "REASON"
     
     try {
-        $arrBackups = Get-ChildItem -Path $strBackupBasePath -Directory | 
-                      Where-Object { $_.Name -match '^\d{8}_\d{6}$' } |
-                      Sort-Object Name -Descending
+        # Get all backup files (both ZIP and directories)
+        $arrZipBackups = Get-ChildItem -Path $strBackupBasePath -Filter "backup_*_UTC_*.zip" -ErrorAction SilentlyContinue
+        $arrDirBackups = Get-ChildItem -Path $strBackupBasePath -Directory -ErrorAction SilentlyContinue | 
+                         Where-Object { $_.Name -match '^\d{8}_\d{6}_UTC$' }
         
-        if ($arrBackups.Count -gt $intMaxBackups) {
-            $arrToRemove = $arrBackups | Select-Object -Skip $intMaxBackups
+        $arrAllBackups = @($arrZipBackups) + @($arrDirBackups) | Sort-Object Name -Descending
+        
+        if ($arrAllBackups.Count -gt $intMaxBackups) {
+            $arrToRemove = $arrAllBackups | Select-Object -Skip $intMaxBackups
             
             Write-Log -strMessage "Found $($arrToRemove.Count) old backup(s) to remove" -strLevel "INFO"
             
             foreach ($objBackup in $arrToRemove) {
-                Write-Log -strMessage "Removing old backup $($objBackup.Name)" -strLevel "ACTION"
+                Write-Log -strMessage "Removing old backup: $($objBackup.Name)" -strLevel "ACTION"
                 Remove-Item -Path $objBackup.FullName -Recurse -Force -ErrorAction Stop
             }
             
             Write-Log -strMessage "Old backups removed successfully" -strLevel "SUCCESS"
+            Write-Log -strMessage "Retained $intMaxBackups most recent backups" -strLevel "INFO"
         }
         else {
-            Write-Log -strMessage "Backup count ($($arrBackups.Count)) within limit ($intMaxBackups)" -strLevel "INFO"
+            Write-Log -strMessage "Backup count ($($arrAllBackups.Count)) within limit ($intMaxBackups)" -strLevel "INFO"
         }
     }
     catch {
-        Write-Log -strMessage "Error during backup cleanup $($_.Exception.Message)" -strLevel "WARNING"
+        Write-Log -strMessage "Error during backup cleanup: $($_.Exception.Message)" -strLevel "WARNING"
     }
 }
 
@@ -564,7 +838,7 @@ function Uninstall-ClineExtension {
         return $true
     }
     catch {
-        Write-Log -strMessage "Error during uninstall $($_.Exception.Message)" -strLevel "ERROR"
+        Write-Log -strMessage "Error during uninstall: $($_.Exception.Message)" -strLevel "ERROR"
         return $false
     }
 }
@@ -596,7 +870,7 @@ function Install-ClineExtension {
         }
     }
     catch {
-        Write-Log -strMessage "Error during installation $($_.Exception.Message)" -strLevel "ERROR"
+        Write-Log -strMessage "Error during installation: $($_.Exception.Message)" -strLevel "ERROR"
         return $false
     }
 }
@@ -606,15 +880,36 @@ function Install-ClineExtension {
 # ============================================================================
 
 function Restore-ClineTasks {
-    param([Parameter(Mandatory=$true)][string]$strBackupDir)
+    param([Parameter(Mandatory=$true)][string]$strBackupSource)
     
     Write-LogHeader -strTitle "RESTORING CLINE TASKS"
+    
+    # Check if source is ZIP file
+    $boolIsZip = $strBackupSource -like "*.zip"
+    $strBackupDir = $strBackupSource
+    
+    if ($boolIsZip) {
+        Write-Log -strMessage "Extracting backup from ZIP file" -strLevel "ACTION"
+        $strExtractPath = Join-Path $BackupPath "temp_restore_$($script:strTimestamp)"
+        
+        try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($strBackupSource, $strExtractPath)
+            $strBackupDir = $strExtractPath
+            Write-Log -strMessage "Backup extracted successfully" -strLevel "SUCCESS"
+        }
+        catch {
+            Write-Log -strMessage "Error extracting backup: $($_.Exception.Message)" -strLevel "ERROR"
+            return $false
+        }
+    }
     
     $strTasksBackup = Join-Path $strBackupDir "tasks"
     $strTasksTarget = Join-Path $script:strClineGlobalStorage "tasks"
     
     if (-not (Test-Path $strTasksBackup)) {
         Write-Log -strMessage "No tasks backup found to restore" -strLevel "WARNING"
+        if ($boolIsZip) { Remove-Item -Path $strExtractPath -Recurse -Force -ErrorAction SilentlyContinue }
         return $false
     }
     
@@ -630,7 +925,7 @@ function Restore-ClineTasks {
         foreach ($objTaskDir in $arrTaskDirs) {
             $strDestPath = Join-Path $strTasksTarget $objTaskDir.Name
             Copy-Item -Path $objTaskDir.FullName -Destination $strDestPath -Recurse -Force -ErrorAction Stop
-            Write-Log -strMessage "Restored task $($objTaskDir.Name)" -strLevel "INFO"
+            Write-Log -strMessage "Restored task: $($objTaskDir.Name)" -strLevel "INFO"
         }
         
         # Restore task history
@@ -645,18 +940,37 @@ function Restore-ClineTasks {
         }
         
         Write-Log -strMessage "Tasks restored successfully" -strLevel "SUCCESS"
+        
+        # Cleanup temp extraction
+        if ($boolIsZip) {
+            Remove-Item -Path $strExtractPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        
         return $true
     }
     catch {
-        Write-Log -strMessage "Error restoring tasks $($_.Exception.Message)" -strLevel "ERROR"
+        Write-Log -strMessage "Error restoring tasks: $($_.Exception.Message)" -strLevel "ERROR"
+        if ($boolIsZip) { Remove-Item -Path $strExtractPath -Recurse -Force -ErrorAction SilentlyContinue }
         return $false
     }
 }
 
 function Restore-MCPSettings {
-    param([Parameter(Mandatory=$true)][string]$strBackupDir)
+    param([Parameter(Mandatory=$true)][string]$strBackupSource)
     
     Write-LogHeader -strTitle "RESTORING MCP SETTINGS"
+    
+    # Determine backup directory (handle ZIP files)
+    $boolIsZip = $strBackupSource -like "*.zip"
+    $strBackupDir = $strBackupSource
+    
+    if ($boolIsZip) {
+        $strBackupDir = Join-Path $BackupPath "temp_restore_$($script:strTimestamp)"
+        if (-not (Test-Path $strBackupDir)) {
+            Write-Log -strMessage "Temp extraction path not found" -strLevel "WARNING"
+            return $true
+        }
+    }
     
     # Restore MCP settings file
     $strMCPBackup = Join-Path $strBackupDir "settings\cline_mcp_settings.json"
@@ -674,7 +988,7 @@ function Restore-MCPSettings {
             Write-Log -strMessage "MCP settings restored successfully" -strLevel "SUCCESS"
         }
         catch {
-            Write-Log -strMessage "Error restoring MCP settings $($_.Exception.Message)" -strLevel "ERROR"
+            Write-Log -strMessage "Error restoring MCP settings: $($_.Exception.Message)" -strLevel "ERROR"
         }
     }
     
@@ -690,7 +1004,7 @@ function Restore-MCPSettings {
             Write-Log -strMessage "Custom MCP servers restored" -strLevel "SUCCESS"
         }
         catch {
-            Write-Log -strMessage "Error restoring custom MCP servers $($_.Exception.Message)" -strLevel "ERROR"
+            Write-Log -strMessage "Error restoring custom MCP servers: $($_.Exception.Message)" -strLevel "ERROR"
         }
     }
     
@@ -698,9 +1012,21 @@ function Restore-MCPSettings {
 }
 
 function Restore-ClineRules {
-    param([Parameter(Mandatory=$true)][string]$strBackupDir)
+    param([Parameter(Mandatory=$true)][string]$strBackupSource)
     
     Write-LogHeader -strTitle "RESTORING CLINE RULES AND WORKFLOWS"
+    
+    # Determine backup directory (handle ZIP files)
+    $boolIsZip = $strBackupSource -like "*.zip"
+    $strBackupDir = $strBackupSource
+    
+    if ($boolIsZip) {
+        $strBackupDir = Join-Path $BackupPath "temp_restore_$($script:strTimestamp)"
+        if (-not (Test-Path $strBackupDir)) {
+            Write-Log -strMessage "Temp extraction path not found" -strLevel "WARNING"
+            return $true
+        }
+    }
     
     # Restore Rules
     $strRulesBackup = Join-Path $strBackupDir "rules"
@@ -715,7 +1041,7 @@ function Restore-ClineRules {
             Write-Log -strMessage "Cline rules restored successfully" -strLevel "SUCCESS"
         }
         catch {
-            Write-Log -strMessage "Error restoring rules $($_.Exception.Message)" -strLevel "ERROR"
+            Write-Log -strMessage "Error restoring rules: $($_.Exception.Message)" -strLevel "ERROR"
         }
     }
     
@@ -731,7 +1057,7 @@ function Restore-ClineRules {
             Write-Log -strMessage "Cline workflows restored successfully" -strLevel "SUCCESS"
         }
         catch {
-            Write-Log -strMessage "Error restoring workflows $($_.Exception.Message)" -strLevel "ERROR"
+            Write-Log -strMessage "Error restoring workflows: $($_.Exception.Message)" -strLevel "ERROR"
         }
     }
     
@@ -765,7 +1091,7 @@ function Set-VSCodeSidebarPosition {
         return $true
     }
     catch {
-        Write-Log -strMessage "Error configuring sidebar $($_.Exception.Message)" -strLevel "WARNING"
+        Write-Log -strMessage "Error configuring sidebar: $($_.Exception.Message)" -strLevel "WARNING"
         return $false
     }
 }
@@ -777,37 +1103,59 @@ function Set-VSCodeSidebarPosition {
 function Start-RepairProcess {
     Write-LogHeader -strTitle "CLINE REPAIR TOOL v$script:strScriptVersion"
     
-    Write-Host ""
-    Write-Host "==============================================================================" -ForegroundColor Cyan
-    Write-Host "                    Cline VS Code Extension Repair Tool                       " -ForegroundColor Cyan
-    Write-Host "                              Version $script:strScriptVersion                           " -ForegroundColor Cyan
-    Write-Host "==============================================================================" -ForegroundColor Cyan
-    Write-Host ""
+    if (-not $JsonOutput) {
+        Write-Host ""
+        Write-Host "==============================================================================" -ForegroundColor Cyan
+        Write-Host "                    Cline VS Code Extension Repair Tool                       " -ForegroundColor Cyan
+        Write-Host "                              Version $script:strScriptVersion                           " -ForegroundColor Cyan
+        Write-Host "==============================================================================" -ForegroundColor Cyan
+        Write-Host ""
+    }
     
     Write-Log -strMessage "Cline Repair Tool v$script:strScriptVersion started" -strLevel "INFO"
-    Write-Log -strMessage "Platform Windows 11" -strLevel "INFO"
-    Write-Log -strMessage "Backup Path $BackupPath" -strLevel "INFO"
+    Write-Log -strMessage "Platform: Windows" -strLevel "INFO"
+    Write-Log -strMessage "Backup Path: $BackupPath" -strLevel "INFO"
+    Write-Log -strMessage "Max Backups: $script:intMaxBackups" -strLevel "INFO"
+    Write-Log -strMessage "Compression: $(-not $NoCompress)" -strLevel "INFO"
+    Write-Log -strMessage "Hash Algorithm: $HashAlgorithm" -strLevel "INFO"
     
-    # Step 1: Check Administrator privileges
+    # Step 1: Verify existing backups
+    Invoke-BackupIntegrityCheck
+    
+    # Step 2: Check Administrator privileges
     if (-not (Test-AdminPrivileges)) {
-        Write-Log -strMessage "Script terminated due to insufficient privileges" -strLevel "ERROR"
+        $script:objJsonResult.status = "failed"
+        $script:objJsonResult.errors += "Insufficient privileges"
+        if ($JsonOutput) { 
+            $script:objJsonResult | ConvertTo-Json -Depth 10 | Write-Output 
+        }
         exit 1
     }
     
-    # Step 2: Detect VS Code installation
+    # Step 3: Detect VS Code installation
     $objVSCode = Get-VSCodeInstallation
     if (-not $objVSCode) {
-        Write-Log -strMessage "Script terminated VS Code not found" -strLevel "ERROR"
+        $script:objJsonResult.status = "failed"
+        $script:objJsonResult.errors += "VS Code not found"
+        if ($JsonOutput) { 
+            $script:objJsonResult | ConvertTo-Json -Depth 10 | Write-Output 
+        }
         exit 1
     }
     
-    # Step 3: Check for running VS Code processes
+    # Step 4: Check for running VS Code processes
     if (-not (Stop-VSCodeProcesses)) {
-        Write-Log -strMessage "Script terminated VS Code still running" -strLevel "ERROR"
+        $script:objJsonResult.status = "failed"
+        $script:objJsonResult.errors += "VS Code still running"
+        if ($JsonOutput) { 
+            $script:objJsonResult | ConvertTo-Json -Depth 10 | Write-Output 
+        }
         exit 1
     }
     
-    # Step 4: Create backup
+    # Step 5: Create backup
+    $strBackupLocation = ""
+    
     if (-not $SkipBackup) {
         try {
             $strBackupDir = New-BackupDirectory
@@ -817,108 +1165,171 @@ function Start-RepairProcess {
                 totalSize = 0
             }
             
-            # Backup tasks
+            # Backup all components
             $objTasksResult = Backup-ClineTasks -strBackupDir $strBackupDir
             $objBackupStats.totalSize += $objTasksResult.size
             $objBackupStats.items += $objTasksResult.items
+            $script:objJsonResult.itemsBackedUp += $objTasksResult.count
             
-            # Backup MCP settings
             $objMCPResult = Backup-MCPSettings -strBackupDir $strBackupDir
             $objBackupStats.totalSize += $objMCPResult.size
+            $script:objJsonResult.itemsBackedUp += $objMCPResult.count
             
-            # Backup rules
             $objRulesResult = Backup-ClineRules -strBackupDir $strBackupDir
             $objBackupStats.totalSize += $objRulesResult.size
+            $script:objJsonResult.itemsBackedUp += $objRulesResult.count
             
-            # Backup checkpoints
             $objCheckpointsResult = Backup-ClineCheckpoints -strBackupDir $strBackupDir
             $objBackupStats.totalSize += $objCheckpointsResult.size
+            $script:objJsonResult.itemsBackedUp += $objCheckpointsResult.count
             
             # Create manifest
             New-BackupManifest -strBackupDir $strBackupDir -objBackupStats $objBackupStats
             
+            # Compress backup if not disabled
+            if (-not $NoCompress) {
+                $strBackupLocation = Compress-BackupDirectory -strBackupDir $strBackupDir -objBackupStats $objBackupStats
+            }
+            else {
+                $strBackupLocation = $strBackupDir
+                $script:objJsonResult.backupSize = $objBackupStats.totalSize
+            }
+            
+            $script:objJsonResult.backupPath = $strBackupLocation
+            
             # Cleanup old backups
             Remove-OldBackups -strBackupBasePath $BackupPath -intMaxBackups $script:intMaxBackups
             
-            Write-Host ""
-            Write-Host "Backup completed successfully!" -ForegroundColor Green
-            Write-Host "  Location: $strBackupDir" -ForegroundColor Cyan
-            Write-Host "  Total Size: $([math]::Round($objBackupStats.totalSize / 1MB, 2)) MB" -ForegroundColor Cyan
-            Write-Host ""
+            if (-not $JsonOutput) {
+                Write-Host ""
+                Write-Host "Backup completed successfully!" -ForegroundColor Green
+                Write-Host "  Location: $strBackupLocation" -ForegroundColor Cyan
+                Write-Host "  Items: $($script:objJsonResult.itemsBackedUp)" -ForegroundColor Cyan
+                Write-Host "  Size: $([math]::Round($script:objJsonResult.backupSize / 1MB, 2)) MB" -ForegroundColor Cyan
+                Write-Host ""
+            }
             
             if ($BackupOnly) {
-                Write-Log -strMessage "Backup-only mode backup completed" -strLevel "SUCCESS"
-                Write-Host "Backup-only mode - repair skipped." -ForegroundColor Yellow
-                Write-Host "Log file: $script:strLogFilePath" -ForegroundColor Cyan
+                Write-Log -strMessage "Backup-only mode: backup completed" -strLevel "SUCCESS"
+                $script:objJsonResult.status = "completed"
+                
+                if ($JsonOutput) {
+                    $script:objJsonResult | ConvertTo-Json -Depth 10 | Write-Output
+                }
+                else {
+                    Write-Host "Backup-only mode - repair skipped." -ForegroundColor Yellow
+                    Write-Host "Log file: $script:strLogFilePath" -ForegroundColor Cyan
+                }
                 return $true
             }
         }
         catch {
-            Write-Log -strMessage "Backup failed $($_.Exception.Message)" -strLevel "ERROR"
-            Write-Host ""
-            Write-Host "Backup failed! Cannot proceed with repair." -ForegroundColor Red
-            Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Log -strMessage "Backup failed: $($_.Exception.Message)" -strLevel "ERROR"
+            $script:objJsonResult.status = "failed"
+            $script:objJsonResult.errors += "Backup failed: $($_.Exception.Message)"
+            
+            if ($JsonOutput) {
+                $script:objJsonResult | ConvertTo-Json -Depth 10 | Write-Output
+            }
+            else {
+                Write-Host ""
+                Write-Host "Backup failed! Cannot proceed with repair." -ForegroundColor Red
+                Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+            }
             return $false
         }
     }
     else {
         Write-Log -strMessage "Backup skipped by user request" -strLevel "WARNING"
+        
+        if (-not $JsonOutput) {
+            Write-Host ""
+            Write-Host "WARNING: Backup skipped!" -ForegroundColor Yellow
+            Write-Host "Press any key to continue or Ctrl+C to cancel..." -ForegroundColor Yellow
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+    }
+    
+    # Step 6: Uninstall Cline extension
+    if (-not $JsonOutput) {
         Write-Host ""
-        Write-Host "WARNING: Backup skipped!" -ForegroundColor Yellow
-        Write-Host "Press any key to continue or Ctrl+C to cancel..." -ForegroundColor Yellow
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        Write-Host "Uninstalling Cline extension..." -ForegroundColor Yellow
     }
     
-    # Step 5: Uninstall Cline extension
-    Write-Host ""
-    Write-Host "Uninstalling Cline extension..." -ForegroundColor Yellow
     if (-not (Uninstall-ClineExtension)) {
-        Write-Log -strMessage "Uninstall failed attempting to continue" -strLevel "WARNING"
-        Write-Host "Uninstall encountered issues, but continuing..." -ForegroundColor Yellow
+        Write-Log -strMessage "Uninstall encountered issues, continuing..." -strLevel "WARNING"
+        
+        if (-not $JsonOutput) {
+            Write-Host "Uninstall encountered issues, but continuing..." -ForegroundColor Yellow
+        }
     }
     
-    # Step 6: Install Cline extension
-    Write-Host ""
-    Write-Host "Installing Cline extension..." -ForegroundColor Yellow
+    # Step 7: Install Cline extension
+    if (-not $JsonOutput) {
+        Write-Host ""
+        Write-Host "Installing Cline extension..." -ForegroundColor Yellow
+    }
+    
     if (-not (Install-ClineExtension)) {
         Write-Log -strMessage "Installation failed" -strLevel "ERROR"
-        Write-Host ""
-        Write-Host "Installation failed! Please install manually." -ForegroundColor Red
+        $script:objJsonResult.status = "failed"
+        $script:objJsonResult.errors += "Installation failed"
+        
+        if ($JsonOutput) {
+            $script:objJsonResult | ConvertTo-Json -Depth 10 | Write-Output
+        }
+        else {
+            Write-Host ""
+            Write-Host "Installation failed! Please install manually." -ForegroundColor Red
+        }
         return $false
     }
     
-    # Step 7: Restore user data
-    if (-not $SkipBackup) {
-        Write-Host ""
-        Write-Host "Restoring user data..." -ForegroundColor Yellow
+    # Step 8: Restore user data
+    if (-not $SkipBackup -and $strBackupLocation) {
+        if (-not $JsonOutput) {
+            Write-Host ""
+            Write-Host "Restoring user data..." -ForegroundColor Yellow
+        }
         
-        Restore-ClineTasks -strBackupDir $strBackupDir
-        Restore-MCPSettings -strBackupDir $strBackupDir
-        Restore-ClineRules -strBackupDir $strBackupDir
+        Restore-ClineTasks -strBackupSource $strBackupLocation
+        Restore-MCPSettings -strBackupSource $strBackupLocation
+        Restore-ClineRules -strBackupSource $strBackupLocation
     }
     
-    # Step 8: Configure sidebar
+    # Step 9: Configure sidebar
     Set-VSCodeSidebarPosition
     
-    # Step 9: Success message
+    # Step 10: Success message
     Write-LogHeader -strTitle "REPAIR COMPLETED SUCCESSFULLY"
     
-    Write-Host ""
-    Write-Host "==============================================================================" -ForegroundColor Green
-    Write-Host "                        REPAIR COMPLETED SUCCESSFULLY                          " -ForegroundColor Green
-    Write-Host "==============================================================================" -ForegroundColor Green
-    Write-Host ""
-    Write-Host "The Cline extension has been repaired!" -ForegroundColor Green
-    Write-Host ""
-    Write-Host "Next Steps:" -ForegroundColor Cyan
-    Write-Host "  1. Launch VS Code" -ForegroundColor White
-    Write-Host "  2. Verify Cline appears in the left sidebar" -ForegroundColor White
-    Write-Host "  3. Re-enter your API key if needed" -ForegroundColor White
-    Write-Host "  4. Check that your tasks and settings are restored" -ForegroundColor White
-    Write-Host ""
-    Write-Host "Backup Location: $strBackupDir" -ForegroundColor Cyan
-    Write-Host "Log File: $script:strLogFilePath" -ForegroundColor Cyan
-    Write-Host ""
+    $script:objJsonResult.status = "completed"
+    
+    if ($JsonOutput) {
+        $script:objJsonResult | ConvertTo-Json -Depth 10 | Write-Output
+    }
+    else {
+        Write-Host ""
+        Write-Host "==============================================================================" -ForegroundColor Green
+        Write-Host "                        REPAIR COMPLETED SUCCESSFULLY                          " -ForegroundColor Green
+        Write-Host "==============================================================================" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "The Cline extension has been repaired!" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "Next Steps:" -ForegroundColor Cyan
+        Write-Host "  1. Launch VS Code" -ForegroundColor White
+        Write-Host "  2. Verify Cline appears in the left sidebar" -ForegroundColor White
+        Write-Host "  3. Re-enter your API key if needed" -ForegroundColor White
+        Write-Host "  4. Check that your tasks and settings are restored" -ForegroundColor White
+        Write-Host ""
+        
+        if ($strBackupLocation) {
+            Write-Host "Backup Location: $strBackupLocation" -ForegroundColor Cyan
+        }
+        
+        Write-Host "Log File: $script:strLogFilePath" -ForegroundColor Cyan
+        Write-Host ""
+    }
     
     Write-Log -strMessage "Repair process completed successfully" -strLevel "SUCCESS"
     return $true
@@ -939,11 +1350,19 @@ try {
     }
 }
 catch {
-    Write-Log -strMessage "Unexpected error $($_.Exception.Message)" -strLevel "ERROR"
-    Write-Host ""
-    Write-Host "An unexpected error occurred:" -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Log file: $script:strLogFilePath" -ForegroundColor Cyan
+    Write-Log -strMessage "Unexpected error: $($_.Exception.Message)" -strLevel "ERROR"
+    $script:objJsonResult.status = "failed"
+    $script:objJsonResult.errors += "Unexpected error: $($_.Exception.Message)"
+    
+    if ($JsonOutput) {
+        $script:objJsonResult | ConvertTo-Json -Depth 10 | Write-Output
+    }
+    else {
+        Write-Host ""
+        Write-Host "An unexpected error occurred:" -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        Write-Host ""
+        Write-Host "Log file: $script:strLogFilePath" -ForegroundColor Cyan
+    }
     exit 1
 }

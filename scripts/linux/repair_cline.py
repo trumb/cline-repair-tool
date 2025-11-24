@@ -4,17 +4,27 @@ Cline VS Code Extension Repair Tool for Linux
 
 This script performs a complete repair of the Cline VS Code extension by:
 1. Backing up all user data (tasks, history, MCP settings, rules, workflows)
-2. Uninstalling the current Cline extension
-3. Performing a clean reinstallation
-4. Restoring all user data
-5. Configuring the sidebar position to left (Primary Side Bar)
+2. Compressing backups to ZIP format with SHA256 hash verification
+3. Uninstalling the current Cline extension
+4. Performing a clean reinstallation
+5. Restoring all user data
+6. Configuring the sidebar position to left (Primary Side Bar)
 
 The script requires root/sudo privileges to ensure complete access to all
 VS Code directories and proper extension management.
 
-Version: 1.0.0
+Enhanced Features:
+- 367 backup retention (daily backups for a year)
+- UTC timestamps with hour/minute/second precision
+- ZIP compression with integrity verification
+- SHA256 hash in filename for backup verification
+- JSON input/output support for automation
+- Automatic verification of existing backups on startup
+
+Version: 2.0.0
 Author: Cline Repair Tool
 Created: 2025-11-24
+Updated: 2025-11-24
 Requires: Python 3.6+, sudo privileges, VS Code installed
 """
 
@@ -25,7 +35,9 @@ import shutil
 import subprocess
 import argparse
 import re
-from datetime import datetime
+import hashlib
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -33,10 +45,14 @@ from typing import Dict, List, Optional, Tuple
 # SCRIPT INITIALIZATION
 # ============================================================================
 
-STR_SCRIPT_VERSION = "1.0.0"
-STR_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+STR_SCRIPT_VERSION = "2.0.0"
+
+# Generate UTC timestamp with hour/minute/second precision
+DT_NOW_UTC = datetime.now(timezone.utc)
+STR_TIMESTAMP = DT_NOW_UTC.strftime("%Y%m%d_%H%M%S") + "_UTC"
+
 STR_CLINE_EXTENSION_ID = "saoudrizwan.claude-dev"
-INT_MAX_BACKUPS = 5
+INT_MAX_BACKUPS = 367  # Keep one year of daily backups
 
 # Data location paths (Linux)
 STR_HOME_DIR = str(Path.home())
@@ -44,6 +60,218 @@ STR_VSCODE_EXTENSIONS = os.path.join(STR_HOME_DIR, ".vscode", "extensions")
 STR_VSCODE_USER_DATA = os.path.join(STR_HOME_DIR, ".config", "Code", "User")
 STR_CLINE_GLOBAL_STORAGE = os.path.join(STR_VSCODE_USER_DATA, "globalStorage", "saoudrizwan.claude-dev")
 STR_CLINE_DOCUMENTS = os.path.join(STR_HOME_DIR, "Documents", "Cline")
+
+# JSON output object (will be initialized in main)
+DICT_JSON_RESULT = {}
+
+# ============================================================================
+# HASH AND COMPRESSION FUNCTIONS
+# ============================================================================
+
+def calculate_file_hash(strFilePath: str, strAlgorithm: str = "sha256") -> str:
+    """
+    Calculate hash of a file.
+    
+    Args:
+        strFilePath: Path to file
+        strAlgorithm: Hash algorithm (sha256, sha1, md5)
+        
+    Returns:
+        Hex digest of hash
+    """
+    try:
+        if strAlgorithm.lower() == "sha256":
+            objHash = hashlib.sha256()
+        elif strAlgorithm.lower() == "sha1":
+            objHash = hashlib.sha1()
+        elif strAlgorithm.lower() == "md5":
+            objHash = hashlib.md5()
+        else:
+            objHash = hashlib.sha256()
+        
+        with open(strFilePath, 'rb') as fileInput:
+            while True:
+                bytesData = fileInput.read(8192)
+                if not bytesData:
+                    break
+                objHash.update(bytesData)
+        
+        return objHash.hexdigest()
+    except Exception as e:
+        return ""
+
+def get_short_hash(strFullHash: str) -> str:
+    """
+    Get first 8 characters of hash.
+    
+    Args:
+        strFullHash: Full hash string
+        
+    Returns:
+        First 8 characters
+    """
+    return strFullHash[:8] if len(strFullHash) >= 8 else strFullHash
+
+def verify_backup_integrity(strZipPath: str, strHashAlgorithm: str, objLogger: ClineLogger) -> Optional[bool]:
+    """
+    Verify integrity of a backup ZIP file using hash in filename.
+    
+    Args:
+        strZipPath: Path to ZIP file
+        strHashAlgorithm: Hash algorithm to use
+        objLogger: Logger instance
+        
+    Returns:
+        True if verified, False if failed, None if unknown (legacy format)
+    """
+    objLogger.log(f"Verifying backup integrity for {os.path.basename(strZipPath)}", "INFO")
+    
+    # Extract hash from filename (format: backup_YYYYMMDD_HHMMSS_UTC_{8-char-hash}.zip)
+    strFileName = os.path.splitext(os.path.basename(strZipPath))[0]
+    
+    objMatch = re.search(r'_([A-Fa-f0-9]{8})$', strFileName)
+    if objMatch:
+        strExpectedHash = objMatch.group(1).lower()
+        
+        # Calculate actual hash
+        strFullHash = calculate_file_hash(strZipPath, strHashAlgorithm)
+        strActualHash = get_short_hash(strFullHash).lower()
+        
+        if strActualHash == strExpectedHash:
+            objLogger.log(f"✓ Integrity verified: {strFileName}", "SUCCESS")
+            return True
+        else:
+            objLogger.log(f"✗ Integrity check FAILED: {strFileName} (expected: {strExpectedHash}, got: {strActualHash})", "WARNING")
+            return False
+    else:
+        objLogger.log(f"No hash found in filename: {strFileName} (legacy backup format)", "INFO")
+        return None
+
+def verify_existing_backups(strBackupPath: str, strHashAlgorithm: str, objLogger: ClineLogger):
+    """
+    Verify integrity of all existing backup ZIP files.
+    
+    Args:
+        strBackupPath: Base backup directory
+        strHashAlgorithm: Hash algorithm to use
+        objLogger: Logger instance
+    """
+    objLogger.log_header("VERIFYING EXISTING BACKUPS")
+    
+    objLogger.log("Checking integrity of existing backup files", "ACTION")
+    objLogger.log("Ensures all backups are uncorrupted and can be restored if needed", "REASON")
+    
+    try:
+        if not os.path.exists(strBackupPath):
+            objLogger.log("No existing backups found to verify", "INFO")
+            return
+        
+        arrZipFiles = [
+            f for f in os.listdir(strBackupPath)
+            if f.startswith("backup_") and f.endswith("_UTC_*.zip") and os.path.isfile(os.path.join(strBackupPath, f))
+        ]
+        
+        # Better pattern matching
+        arrZipFiles = [
+            f for f in os.listdir(strBackupPath)
+            if f.endswith(".zip") and re.match(r'backup_\d{8}_\d{6}_UTC_[A-Fa-f0-9]{8}\.zip', f)
+        ]
+        
+        if not arrZipFiles:
+            objLogger.log("No existing backups found to verify", "INFO")
+            return
+        
+        objLogger.log(f"Found {len(arrZipFiles)} backup(s) to verify", "INFO")
+        
+        intVerified = 0
+        intFailed = 0
+        intLegacy = 0
+        
+        for strZipFile in arrZipFiles:
+            strZipPath = os.path.join(strBackupPath, strZipFile)
+            objResult = verify_backup_integrity(strZipPath, strHashAlgorithm, objLogger)
+            
+            if objResult is True:
+                intVerified += 1
+            elif objResult is False:
+                intFailed += 1
+            else:
+                intLegacy += 1
+        
+        objLogger.log(f"Integrity check complete: {intVerified} verified, {intFailed} failed, {intLegacy} legacy format", "SUCCESS")
+        
+        if intFailed > 0:
+            objLogger.log(f"WARNING: {intFailed} backup(s) failed integrity check - consider removing them", "WARNING")
+    
+    except Exception as e:
+        objLogger.log(f"Error during integrity check: {str(e)}", "WARNING")
+
+def compress_backup_directory(strBackupDir: str, dictBackupStats: Dict[str, any], 
+                              strBackupPath: str, strHashAlgorithm: str, 
+                              objLogger: ClineLogger) -> str:
+    """
+    Compress backup directory to ZIP format with hash in filename.
+    
+    Args:
+        strBackupDir: Directory to compress
+        dictBackupStats: Backup statistics
+        strBackupPath: Base backup path
+        strHashAlgorithm: Hash algorithm to use
+        objLogger: Logger instance
+        
+    Returns:
+        Path to created ZIP file
+    """
+    objLogger.log_header("COMPRESSING BACKUP")
+    
+    objLogger.log("Compressing backup directory to ZIP format", "ACTION")
+    objLogger.log("Reduces storage space and enables integrity verification", "REASON")
+    
+    try:
+        # Calculate hash of manifest file
+        strManifestPath = os.path.join(strBackupDir, "backup_manifest.json")
+        strFullHash = calculate_file_hash(strManifestPath, strHashAlgorithm)
+        strShortHash = get_short_hash(strFullHash)
+        
+        # Create ZIP filename with hash
+        strZipFileName = f"backup_{STR_TIMESTAMP}_{strShortHash}.zip"
+        strZipPath = os.path.join(strBackupPath, strZipFileName)
+        
+        objLogger.log(f"Creating ZIP file: {strZipFileName}", "INFO")
+        
+        # Create ZIP file
+        with zipfile.ZipFile(strZipPath, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as objZipFile:
+            for strRoot, arrDirs, arrFiles in os.walk(strBackupDir):
+                for strFile in arrFiles:
+                    strFilePath = os.path.join(strRoot, strFile)
+                    strArcName = os.path.relpath(strFilePath, strBackupDir)
+                    objZipFile.write(strFilePath, strArcName)
+        
+        # Get ZIP file size
+        intZipSize = os.path.getsize(strZipPath)
+        floatCompressionRatio = (intZipSize / dictBackupStats["totalSize"]) * 100 if dictBackupStats["totalSize"] > 0 else 100
+        
+        objLogger.log("Backup compressed successfully", "SUCCESS")
+        objLogger.log(f"Original size: {dictBackupStats['totalSize'] / (1024 * 1024):.2f} MB", "INFO")
+        objLogger.log(f"Compressed size: {intZipSize / (1024 * 1024):.2f} MB ({floatCompressionRatio:.2f}% of original)", "INFO")
+        objLogger.log(f"Hash: {strFullHash}", "INFO")
+        
+        # Calculate all hash types for JSON output
+        if DICT_JSON_RESULT:
+            DICT_JSON_RESULT["hashes"]["sha256"] = calculate_file_hash(strZipPath, "sha256")
+            DICT_JSON_RESULT["hashes"]["sha1"] = calculate_file_hash(strZipPath, "sha1")
+            DICT_JSON_RESULT["hashes"]["md5"] = calculate_file_hash(strZipPath, "md5")
+            DICT_JSON_RESULT["backupSize"] = intZipSize
+        
+        # Remove uncompressed directory
+        objLogger.log("Removing uncompressed backup directory", "INFO")
+        shutil.rmtree(strBackupDir)
+        
+        return strZipPath
+    
+    except Exception as e:
+        objLogger.log(f"Error during compression: {str(e)}", "ERROR")
+        return strBackupDir  # Return original directory if compression failed
 
 # ============================================================================
 # LOGGING FUNCTIONS
