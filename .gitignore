@@ -1,0 +1,52 @@
+# Operating System Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor Directories
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Backup Files
+*.bak
+*.backup
+*.old
+
+# Log Files
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Temporary Files
+*.tmp
+.temp/
+temp/
+
+# Personal Notes (not part of official docs)
+NOTES.txt
+TODO.txt
+scratch/
+
+# Test Artifacts
+test-output/
+.pytest_cache/
+
+# GitHub Tokens
+.github-token
+github-token.txt
+
+# Local Configuration
+local-config.json
+.env.local
