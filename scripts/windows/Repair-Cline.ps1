@@ -538,7 +538,7 @@ function Backup-ClineTasks {
             Write-Log -strMessage "Task history index backed up" -strLevel "INFO"
         }
         
-        Write-Log -strMessage "Backed up $($objResult.count) tasks ($([math]::Round($objResult.size / 1MB, 2)) MB)" -strLevel "SUCCESS"
+        Write-Log -strMessage "Backed up $($objResult.count) tasks ($([math]::Round($objResult.size / 1MB, 2))) MB" -strLevel "SUCCESS"
     }
     catch {
         Write-Log -strMessage "Error backing up tasks $($_.Exception.Message)" -strLevel "ERROR"
@@ -743,7 +743,7 @@ function Compress-BackupDirectory {
         
         Write-Log -strMessage "Backup compressed successfully" -strLevel "SUCCESS"
         Write-Log -strMessage "Original size: $([math]::Round($objBackupStats.totalSize / 1MB, 2)) MB" -strLevel "INFO"
-        Write-Log -strMessage "Compressed size: $([math]::Round($intZipSize / 1MB, 2)) MB ($floatCompressionRatio% of original)" -strLevel "INFO"
+        Write-Log -strMessage "Compressed size: $([math]::Round($intZipSize / 1MB, 2)) MB (${floatCompressionRatio}% of original)" -strLevel "INFO"
         Write-Log -strMessage "Hash: $strFullHash" -strLevel "INFO"
         
         # Calculate all hash types for JSON output
