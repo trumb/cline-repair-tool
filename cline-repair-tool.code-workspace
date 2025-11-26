@@ -1,27 +1,8 @@
 {
-  "folders": [
-    {
-      "path": "."
-    }
-  ],
-  "settings": {
-    "editor.formatOnSave": true,
-    "editor.tabSize": 4,
-    "editor.insertSpaces": true,
-    "files.trimTrailingWhitespace": true,
-    "files.insertFinalNewline": true,
-    "files.trimFinalNewlines": true,
-    "git.defaultBranchName": "main",
-    "powershell.codeFormatting.preset": "OTBS",
-    "powershell.codeFormatting.alignPropertyValuePairs": true,
-    "python.formatting.provider": "black",
-    "python.linting.enabled": true,
-    "python.linting.pylintEnabled": true
-  },
-  "extensions": {
-    "recommendations": [
-      "ms-vscode.powershell",
-      "ms-python.python"
-    ]
-  }
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {}
 }
