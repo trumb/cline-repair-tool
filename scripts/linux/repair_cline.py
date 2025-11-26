@@ -1061,6 +1061,213 @@ def set_vscode_sidebar_position(objLogger: ClineLogger) -> bool:
         return False
 
 # ============================================================================
+# BACKUP LISTING AND RESTORE-ONLY FUNCTIONS
+# ============================================================================
+
+def get_available_backups(strBackupPath: str) -> List[Dict[str, any]]:
+    """
+    Get list of available backups sorted by date (newest first).
+    
+    Args:
+        strBackupPath: Base backup directory
+        
+    Returns:
+        List of backup dictionaries with name, path, timestamp, size, type
+    """
+    arrBackups = []
+    
+    if not os.path.exists(strBackupPath):
+        return arrBackups
+    
+    # Get ZIP backups
+    for strFile in os.listdir(strBackupPath):
+        strFilePath = os.path.join(strBackupPath, strFile)
+        
+        # Check ZIP files
+        if strFile.endswith(".zip") and strFile.startswith("backup_"):
+            objMatch = re.match(r'^backup_(\d{8}_\d{6}_UTC)', strFile)
+            if objMatch:
+                arrBackups.append({
+                    "name": strFile,
+                    "path": strFilePath,
+                    "timestamp": objMatch.group(1),
+                    "size": os.path.getsize(strFilePath),
+                    "type": "ZIP"
+                })
+        
+        # Check directory backups
+        elif os.path.isdir(strFilePath) and re.match(r'^\d{8}_\d{6}_UTC$', strFile):
+            intSize = sum(
+                os.path.getsize(os.path.join(dirpath, filename))
+                for dirpath, dirnames, filenames in os.walk(strFilePath)
+                for filename in filenames
+            )
+            arrBackups.append({
+                "name": strFile,
+                "path": strFilePath,
+                "timestamp": strFile,
+                "size": intSize,
+                "type": "Directory"
+            })
+    
+    # Sort by timestamp descending (newest first)
+    arrBackups.sort(key=lambda x: x["timestamp"], reverse=True)
+    return arrBackups
+
+def show_available_backups(strBackupPath: str, objLogger: ClineLogger):
+    """
+    Display available backups in a formatted list.
+    
+    Args:
+        strBackupPath: Base backup directory
+        objLogger: Logger instance
+    """
+    objLogger.log_header("AVAILABLE BACKUPS")
+    
+    arrBackups = get_available_backups(strBackupPath)
+    
+    if not arrBackups:
+        print(f"\n\033[93mNo backups found in: {strBackupPath}\033[0m\n")
+        return
+    
+    print(f"\n\033[96mFound {len(arrBackups)} backup(s) in: {strBackupPath}\033[0m\n")
+    print("  #  | Timestamp             | Type      | Size")
+    print("-----+-----------------------+-----------+------------")
+    
+    for intIndex, dictBackup in enumerate(arrBackups, 1):
+        strSize = f"{dictBackup['size'] / (1024 * 1024):.2f} MB" if dictBackup['size'] > 1024 * 1024 else f"{dictBackup['size'] / 1024:.2f} KB"
+        strLabel = " (latest)" if intIndex == 1 else ""
+        print(f"  {intIndex}  | {dictBackup['timestamp']} | {dictBackup['type']:<9} | {strSize}{strLabel}")
+    
+    print(f"\n\033[96mTo restore from a specific backup, use:\033[0m")
+    print(f"  python3 repair_cline.py --restore-only --restore-from \"TIMESTAMP\"\n")
+
+def find_backup_by_identifier(strIdentifier: str, strBackupPath: str, objLogger: ClineLogger) -> Optional[str]:
+    """
+    Find a backup by identifier (latest, timestamp, or full path).
+    
+    Args:
+        strIdentifier: Backup identifier
+        strBackupPath: Base backup directory
+        objLogger: Logger instance
+        
+    Returns:
+        Path to backup or None if not found
+    """
+    # Check if it's a full path
+    if os.path.exists(strIdentifier):
+        return strIdentifier
+    
+    arrBackups = get_available_backups(strBackupPath)
+    
+    if not arrBackups:
+        objLogger.log("No backups found to restore from", "ERROR")
+        return None
+    
+    # Handle "latest"
+    if strIdentifier == "latest":
+        objLogger.log(f"Using latest backup: {arrBackups[0]['timestamp']}", "INFO")
+        return arrBackups[0]["path"]
+    
+    # Search by timestamp
+    for dictBackup in arrBackups:
+        if dictBackup["timestamp"] == strIdentifier or strIdentifier in dictBackup["name"]:
+            objLogger.log(f"Found backup: {dictBackup['name']}", "INFO")
+            return dictBackup["path"]
+    
+    objLogger.log(f"No backup found matching: {strIdentifier}", "ERROR")
+    return None
+
+def extract_backup_if_zip(strBackupPath: str, strTempDir: str, objLogger: ClineLogger) -> str:
+    """
+    Extract backup if it's a ZIP file, otherwise return the path as-is.
+    
+    Args:
+        strBackupPath: Path to backup (ZIP or directory)
+        strTempDir: Temporary directory for extraction
+        objLogger: Logger instance
+        
+    Returns:
+        Path to backup directory (extracted or original)
+    """
+    if strBackupPath.endswith(".zip"):
+        objLogger.log("Extracting backup from ZIP file", "ACTION")
+        
+        try:
+            os.makedirs(strTempDir, exist_ok=True)
+            
+            with zipfile.ZipFile(strBackupPath, 'r') as objZipFile:
+                objZipFile.extractall(strTempDir)
+            
+            objLogger.log("Backup extracted successfully", "SUCCESS")
+            return strTempDir
+        except Exception as e:
+            objLogger.log(f"Error extracting backup: {str(e)}", "ERROR")
+            return strBackupPath
+    
+    return strBackupPath
+
+def start_restore_only_process(objArgs: argparse.Namespace, objLogger: ClineLogger) -> bool:
+    """
+    Perform restore-only operation without reinstalling the extension.
+    
+    Args:
+        objArgs: Command-line arguments
+        objLogger: Logger instance
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    objLogger.log_header(f"CLINE RESTORE-ONLY MODE v{STR_SCRIPT_VERSION}")
+    
+    print("\n" + "=" * 80)
+    print("                   Cline VS Code Extension Restore Tool")
+    print(f"                             Version {STR_SCRIPT_VERSION}")
+    print("=" * 80 + "\n")
+    
+    objLogger.log("Restore-only mode started", "INFO")
+    objLogger.log(f"Restore from: {objArgs.restore_from}", "INFO")
+    
+    # Find the backup to restore from
+    strBackupPath = find_backup_by_identifier(objArgs.restore_from, objArgs.backup_path, objLogger)
+    
+    if not strBackupPath:
+        print(f"\n\033[91mBackup not found: {objArgs.restore_from}\033[0m")
+        print("\033[93mUse --list-backups to see available backups.\033[0m\n")
+        return False
+    
+    print(f"\033[96mRestoring from: {strBackupPath}\033[0m\n")
+    
+    # Extract if ZIP
+    strTempDir = os.path.join(objArgs.backup_path, f"temp_restore_{STR_TIMESTAMP}")
+    strBackupDir = extract_backup_if_zip(strBackupPath, strTempDir, objLogger)
+    
+    # Perform restore
+    restore_cline_tasks(strBackupDir, objLogger)
+    restore_mcp_settings(strBackupDir, objLogger)
+    restore_cline_rules(strBackupDir, objLogger)
+    
+    # Cleanup temp extraction
+    if strBackupDir == strTempDir and os.path.exists(strTempDir):
+        shutil.rmtree(strTempDir, ignore_errors=True)
+    
+    # Success message
+    objLogger.log_header("RESTORE COMPLETED")
+    
+    print("\n" + "=" * 80)
+    print("                       RESTORE COMPLETED SUCCESSFULLY")
+    print("=" * 80 + "\n")
+    print("\033[92mData has been restored from backup!\033[0m\n")
+    print(f"\033[96mRestored from: {strBackupPath}\033[0m\n")
+    print("\033[96mNext Steps:\033[0m")
+    print("  1. Restart VS Code if it's running")
+    print("  2. Verify your tasks and settings are restored\n")
+    print(f"\033[96mLog File: {objLogger.strLogFilePath}\033[0m\n")
+    
+    objLogger.log("Restore-only process completed successfully", "SUCCESS")
+    return True
+
+# ============================================================================
 # MAIN EXECUTION LOGIC
 # ============================================================================
 
@@ -1234,6 +1441,25 @@ Examples:
     )
     
     objParser.add_argument(
+        "--restore-only",
+        action="store_true",
+        help="Only restore from an existing backup without reinstalling"
+    )
+    
+    objParser.add_argument(
+        "--restore-from",
+        type=str,
+        default="latest",
+        help="Backup to restore from: 'latest', timestamp, or full path"
+    )
+    
+    objParser.add_argument(
+        "--list-backups",
+        action="store_true",
+        help="List available backups and exit"
+    )
+    
+    objParser.add_argument(
         "--skip-backup",
         action="store_true",
         help="Skip the backup phase (NOT RECOMMENDED)"
@@ -1258,6 +1484,16 @@ Examples:
     strLogFileName = f"cline-repair-{STR_TIMESTAMP}.log"
     strLogFilePath = os.path.join(objArgs.backup_path, strLogFileName)
     objLogger = ClineLogger(strLogFilePath, objArgs.verbose)
+    
+    # Handle --list-backups mode
+    if objArgs.list_backups:
+        show_available_backups(objArgs.backup_path, objLogger)
+        sys.exit(0)
+    
+    # Handle --restore-only mode
+    if objArgs.restore_only:
+        boolSuccess = start_restore_only_process(objArgs, objLogger)
+        sys.exit(0 if boolSuccess else 1)
     
     # Run repair process
     try:
