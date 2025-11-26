@@ -9,13 +9,11 @@ This script performs a complete repair of the Cline VS Code extension by:
 4. Restoring all user data
 5. Configuring the sidebar position to left (Primary Side Bar)
 
-The script requires root/sudo privileges to ensure complete access to all
-VS Code directories and proper extension management.
 
 Version: 1.0.0
 Author: Cline Repair Tool
 Created: 2025-11-24
-Requires: Python 3.6+, sudo privileges, VS Code installed
+Requires: Python 3.6+, VS Code installed
 """
 
 import os
@@ -111,31 +109,8 @@ class ClineLogger:
         self.log(strSeparator, "INFO")
 
 # ============================================================================
-# PRIVILEGE AND ENVIRONMENT CHECKS
+# ENVIRONMENT CHECKS
 # ============================================================================
-
-def check_root_privileges(objLogger: ClineLogger) -> bool:
-    """
-    Check if script is running with root/sudo privileges.
-    
-    Args:
-        objLogger: Logger instance
-        
-    Returns:
-        True if running as root, False otherwise
-    """
-    objLogger.log("Checking for root/sudo privileges", "INFO")
-    
-    intUid = os.getuid()
-    
-    if intUid != 0:
-        objLogger.log("ERROR: This script requires root/sudo privileges", "ERROR")
-        print("\n\033[93mPlease run this script with sudo:\033[0m")
-        print("\033[96m  sudo python3 repair_cline.py\033[0m\n")
-        return False
-    
-    objLogger.log("Root privileges confirmed", "SUCCESS")
-    return True
 
 def get_vscode_installation(objLogger: ClineLogger) -> Optional[Dict[str, any]]:
     """
@@ -884,23 +859,20 @@ def start_repair_process(objArgs: argparse.Namespace, objLogger: ClineLogger) ->
     objLogger.log("Platform: macOS", "INFO")
     objLogger.log(f"Backup Path: {objArgs.backup_path}", "INFO")
     
-    # Step 1: Check root privileges
-    if not check_root_privileges(objLogger):
-        objLogger.log("Script terminated due to insufficient privileges", "ERROR")
-        return False
-    
-    # Step 2: Detect VS Code installation
+    # Step 1: Detect VS Code installation
     dictVSCode = get_vscode_installation(objLogger)
     if not dictVSCode:
         objLogger.log("Script terminated: VS Code not found", "ERROR")
         return False
     
-    # Step 3: Check for running VS Code processes
-    if not stop_vscode_processes(objLogger):
+    # Step 2: Check for running VS Code processes (only required for full repair, not backup-only)
+    if objArgs.backup_only:
+        objLogger.log("Backup-only mode: skipping VS Code process check", "INFO")
+    elif not stop_vscode_processes(objLogger):
         objLogger.log("Script terminated: VS Code still running", "ERROR")
         return False
     
-    # Step 4: Create backup
+    # Step 3: Create backup
     strBackupDir = None
     if not objArgs.skip_backup:
         try:
@@ -956,20 +928,20 @@ def start_repair_process(objArgs: argparse.Namespace, objLogger: ClineLogger) ->
         print("\033[93mPress Enter to continue or Ctrl+C to cancel...\033[0m")
         input()
     
-    # Step 5: Uninstall Cline extension
+    # Step 4: Uninstall Cline extension
     print("\n\033[93mUninstalling Cline extension...\033[0m")
     if not uninstall_cline_extension(objLogger):
         objLogger.log("Uninstall failed: attempting to continue", "WARNING")
         print("\033[93mUninstall encountered issues, but continuing...\033[0m")
     
-    # Step 6: Install Cline extension
+    # Step 5: Install Cline extension
     print("\n\033[93mInstalling Cline extension...\033[0m")
     if not install_cline_extension(objLogger):
         objLogger.log("Installation failed", "ERROR")
         print("\n\033[91mInstallation failed! Please install manually.\033[0m\n")
         return False
     
-    # Step 7: Restore user data
+    # Step 6: Restore user data
     if not objArgs.skip_backup and strBackupDir:
         print("\n\033[93mRestoring user data...\033[0m")
         
@@ -977,10 +949,10 @@ def start_repair_process(objArgs: argparse.Namespace, objLogger: ClineLogger) ->
         restore_mcp_settings(strBackupDir, objLogger)
         restore_cline_rules(strBackupDir, objLogger)
     
-    # Step 8: Configure sidebar
+    # Step 7: Configure sidebar
     set_vscode_sidebar_position(objLogger)
     
-    # Step 9: Success message
+    # Step 8: Success message
     objLogger.log_header("REPAIR COMPLETED SUCCESSFULLY")
     
     print("\n" + "=" * 80)
@@ -1013,16 +985,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  sudo python3 repair_cline.py
+  python3 repair_cline.py
     Performs a complete repair with default settings.
   
-  sudo python3 repair_cline.py --backup-only
+  python3 repair_cline.py --backup-only
     Only creates a backup without performing repair.
   
-  sudo python3 repair_cline.py --backup-path /custom/path
+  python3 repair_cline.py --backup-path /custom/path
     Uses custom backup location.
   
-  sudo python3 repair_cline.py --verbose
+  python3 repair_cline.py --verbose
     Shows detailed output during execution.
         """
     )
