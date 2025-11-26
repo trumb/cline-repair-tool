@@ -188,6 +188,7 @@ $script:objJsonResult = @{
 function Write-Log {
     param(
         [Parameter(Mandatory=$true)]
+        [AllowEmptyString()]
         [string]$strMessage,
         
         [Parameter(Mandatory=$false)]
