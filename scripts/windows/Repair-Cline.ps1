@@ -11,9 +11,6 @@
     5. Restoring all user data
     6. Configuring the sidebar position to left (Primary Side Bar)
     
-    The script requires Administrator privileges to ensure complete access to all
-    VS Code directories and proper extension management.
-    
     Enhanced Features:
     - 367 backup retention (daily backups for a year)
     - UTC timestamps with hour/minute/second precision
@@ -76,7 +73,7 @@
     Author: Cline Repair Tool
     Created: 2025-11-24
     Updated: 2025-11-24
-    Requires: Administrator privileges, VS Code installed
+    Requires: VS Code installed
 #>
 
 [CmdletBinding()]
@@ -347,33 +344,8 @@ function Invoke-BackupIntegrityCheck {
 }
 
 # ============================================================================
-# PRIVILEGE AND ENVIRONMENT CHECKS
+# ENVIRONMENT CHECKS
 # ============================================================================
-
-function Test-AdminPrivileges {
-    Write-Log -strMessage "Checking for Administrator privileges" -strLevel "INFO"
-    
-    $objIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $objPrincipal = New-Object Security.Principal.WindowsPrincipal($objIdentity)
-    $boolIsAdmin = $objPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    
-    if (-not $boolIsAdmin) {
-        Write-Log -strMessage "ERROR This script requires Administrator privileges" -strLevel "ERROR"
-        
-        if (-not $JsonOutput) {
-            Write-Host ""
-            Write-Host "Please run this script as Administrator:" -ForegroundColor Yellow
-            Write-Host "  1. Right-click on PowerShell" -ForegroundColor Cyan
-            Write-Host "  2. Select 'Run as Administrator'" -ForegroundColor Cyan
-            Write-Host "  3. Run the script again" -ForegroundColor Cyan
-            Write-Host ""
-        }
-        return $false
-    }
-    
-    Write-Log -strMessage "Administrator privileges confirmed" -strLevel "SUCCESS"
-    return $true
-}
 
 function Get-VSCodeInstallation {
     Write-Log -strMessage "Detecting VS Code installation" -strLevel "INFO"
@@ -1123,17 +1095,7 @@ function Start-RepairProcess {
     # Step 1: Verify existing backups
     Invoke-BackupIntegrityCheck
     
-    # Step 2: Check Administrator privileges
-    if (-not (Test-AdminPrivileges)) {
-        $script:objJsonResult.status = "failed"
-        $script:objJsonResult.errors += "Insufficient privileges"
-        if ($JsonOutput) { 
-            $script:objJsonResult | ConvertTo-Json -Depth 10 | Write-Output 
-        }
-        exit 1
-    }
-    
-    # Step 3: Detect VS Code installation
+    # Step 2: Detect VS Code installation
     $objVSCode = Get-VSCodeInstallation
     if (-not $objVSCode) {
         $script:objJsonResult.status = "failed"
@@ -1144,7 +1106,7 @@ function Start-RepairProcess {
         exit 1
     }
     
-    # Step 4: Check for running VS Code processes
+    # Step 3: Check for running VS Code processes
     if (-not (Stop-VSCodeProcesses)) {
         $script:objJsonResult.status = "failed"
         $script:objJsonResult.errors += "VS Code still running"
@@ -1154,7 +1116,7 @@ function Start-RepairProcess {
         exit 1
     }
     
-    # Step 5: Create backup
+    # Step 4: Create backup
     $strBackupLocation = ""
     
     if (-not $SkipBackup) {
@@ -1251,7 +1213,7 @@ function Start-RepairProcess {
         }
     }
     
-    # Step 6: Uninstall Cline extension
+    # Step 5: Uninstall Cline extension
     if (-not $JsonOutput) {
         Write-Host ""
         Write-Host "Uninstalling Cline extension..." -ForegroundColor Yellow
@@ -1265,7 +1227,7 @@ function Start-RepairProcess {
         }
     }
     
-    # Step 7: Install Cline extension
+    # Step 6: Install Cline extension
     if (-not $JsonOutput) {
         Write-Host ""
         Write-Host "Installing Cline extension..." -ForegroundColor Yellow
@@ -1286,7 +1248,7 @@ function Start-RepairProcess {
         return $false
     }
     
-    # Step 8: Restore user data
+    # Step 7: Restore user data
     if (-not $SkipBackup -and $strBackupLocation) {
         if (-not $JsonOutput) {
             Write-Host ""
@@ -1298,10 +1260,10 @@ function Start-RepairProcess {
         Restore-ClineRules -strBackupSource $strBackupLocation
     }
     
-    # Step 9: Configure sidebar
+    # Step 8: Configure sidebar
     Set-VSCodeSidebarPosition
     
-    # Step 10: Success message
+    # Step 9: Success message
     Write-LogHeader -strTitle "REPAIR COMPLETED SUCCESSFULLY"
     
     $script:objJsonResult.status = "completed"
