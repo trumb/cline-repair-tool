@@ -744,7 +744,7 @@ function Compress-BackupDirectory {
         
         Write-Log -strMessage "Backup compressed successfully" -strLevel "SUCCESS"
         Write-Log -strMessage "Original size: $([math]::Round($objBackupStats.totalSize / 1MB, 2)) MB" -strLevel "INFO"
-        Write-Log -strMessage "Compressed size: $([math]::Round($intZipSize / 1MB, 2)) MB (${floatCompressionRatio}% of original)" -strLevel "INFO"
+        Write-Log -strMessage "Compressed size: $([math]::Round($intZipSize / 1MB, 2)) MB ($floatCompressionRatio`% of original)" -strLevel "INFO"
         Write-Log -strMessage "Hash: $strFullHash" -strLevel "INFO"
         
         # Calculate all hash types for JSON output
