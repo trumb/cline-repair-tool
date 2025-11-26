@@ -22,6 +22,19 @@
 .PARAMETER BackupOnly
     Only perform backup without uninstall/reinstall. Useful for creating regular backups.
     
+.PARAMETER RestoreOnly
+    Only perform restore from an existing backup without reinstalling the extension.
+    Use with -RestoreFrom to specify which backup to use.
+    
+.PARAMETER RestoreFrom
+    Specify which backup to restore from. Can be:
+    - "latest" (default): Use the most recent backup
+    - A timestamp (e.g., "20251126_120000_UTC"): Use a specific backup
+    - A full path to a backup ZIP or directory
+    
+.PARAMETER ListBackups
+    List all available backups and exit. Useful for finding backup timestamps.
+    
 .PARAMETER SkipBackup
     Skip the backup phase (NOT RECOMMENDED). Only use if you have a recent backup.
     
@@ -61,6 +74,18 @@
     Only creates a backup and keeps last 30 backups.
     
 .EXAMPLE
+    .\Repair-Cline.ps1 -ListBackups
+    Lists all available backups with timestamps and sizes.
+    
+.EXAMPLE
+    .\Repair-Cline.ps1 -RestoreOnly
+    Restores from the most recent backup without reinstalling.
+    
+.EXAMPLE
+    .\Repair-Cline.ps1 -RestoreOnly -RestoreFrom "20251126_120000_UTC"
+    Restores from a specific backup timestamp.
+    
+.EXAMPLE
     .\Repair-Cline.ps1 -JsonOutput
     Performs repair and outputs results in JSON format.
     
@@ -80,6 +105,15 @@
 param(
     [Parameter(Mandatory=$false)]
     [switch]$BackupOnly,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$RestoreOnly,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$RestoreFrom = "latest",
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$ListBackups,
     
     [Parameter(Mandatory=$false)]
     [switch]$SkipBackup,
@@ -127,6 +161,9 @@ if ($JsonInput) {
         
         # Override parameters from JSON
         if ($objJsonConfig.BackupOnly) { $BackupOnly = $true }
+        if ($objJsonConfig.RestoreOnly) { $RestoreOnly = $true }
+        if ($objJsonConfig.RestoreFrom) { $RestoreFrom = $objJsonConfig.RestoreFrom }
+        if ($objJsonConfig.ListBackups) { $ListBackups = $true }
         if ($objJsonConfig.SkipBackup) { $SkipBackup = $true }
         if ($objJsonConfig.BackupPath) { $BackupPath = $objJsonConfig.BackupPath }
         if ($objJsonConfig.MaxBackups) { $MaxBackups = $objJsonConfig.MaxBackups }
@@ -1070,6 +1107,233 @@ function Set-VSCodeSidebarPosition {
 }
 
 # ============================================================================
+# BACKUP LISTING AND RESTORE-ONLY FUNCTIONS
+# ============================================================================
+
+function Get-AvailableBackups {
+    <#
+    .SYNOPSIS
+        Get list of available backups sorted by date (newest first).
+    #>
+    
+    $arrBackups = @()
+    
+    if (-not (Test-Path $BackupPath)) {
+        return $arrBackups
+    }
+    
+    # Get ZIP backups
+    $arrZipFiles = Get-ChildItem -Path $BackupPath -Filter "backup_*_UTC_*.zip" -ErrorAction SilentlyContinue
+    foreach ($objZip in $arrZipFiles) {
+        # Extract timestamp from filename: backup_YYYYMMDD_HHMMSS_UTC_HASH.zip
+        if ($objZip.Name -match '^backup_(\d{8}_\d{6}_UTC)') {
+            $arrBackups += @{
+                Name = $objZip.Name
+                Path = $objZip.FullName
+                Timestamp = $matches[1]
+                Size = $objZip.Length
+                Type = "ZIP"
+                Date = $objZip.LastWriteTime
+            }
+        }
+    }
+    
+    # Get directory backups (uncompressed)
+    $arrDirs = Get-ChildItem -Path $BackupPath -Directory -ErrorAction SilentlyContinue | 
+               Where-Object { $_.Name -match '^\d{8}_\d{6}_UTC$' }
+    foreach ($objDir in $arrDirs) {
+        $intSize = (Get-ChildItem -Path $objDir.FullName -Recurse -File -ErrorAction SilentlyContinue | 
+                   Measure-Object -Property Length -Sum).Sum
+        $arrBackups += @{
+            Name = $objDir.Name
+            Path = $objDir.FullName
+            Timestamp = $objDir.Name
+            Size = $intSize
+            Type = "Directory"
+            Date = $objDir.LastWriteTime
+        }
+    }
+    
+    # Sort by timestamp descending (newest first)
+    return $arrBackups | Sort-Object { $_.Timestamp } -Descending
+}
+
+function Show-AvailableBackups {
+    <#
+    .SYNOPSIS
+        Display available backups in a formatted list.
+    #>
+    
+    Write-LogHeader -strTitle "AVAILABLE BACKUPS"
+    
+    $arrBackups = Get-AvailableBackups
+    
+    if ($arrBackups.Count -eq 0) {
+        if ($JsonOutput) {
+            @{ backups = @(); count = 0 } | ConvertTo-Json -Depth 10 | Write-Output
+        }
+        else {
+            Write-Host ""
+            Write-Host "No backups found in: $BackupPath" -ForegroundColor Yellow
+            Write-Host ""
+        }
+        return
+    }
+    
+    if ($JsonOutput) {
+        @{ 
+            backups = $arrBackups
+            count = $arrBackups.Count
+            backupPath = $BackupPath
+        } | ConvertTo-Json -Depth 10 | Write-Output
+    }
+    else {
+        Write-Host ""
+        Write-Host "Found $($arrBackups.Count) backup(s) in: $BackupPath" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  #  | Timestamp             | Type      | Size" -ForegroundColor White
+        Write-Host "-----+-----------------------+-----------+------------" -ForegroundColor Gray
+        
+        $intIndex = 1
+        foreach ($objBackup in $arrBackups) {
+            $strSize = if ($objBackup.Size -gt 1MB) { 
+                "$([math]::Round($objBackup.Size / 1MB, 2)) MB" 
+            } else { 
+                "$([math]::Round($objBackup.Size / 1KB, 2)) KB" 
+            }
+            
+            $strLabel = if ($intIndex -eq 1) { " (latest)" } else { "" }
+            Write-Host "  $intIndex  | $($objBackup.Timestamp) | $($objBackup.Type.PadRight(9)) | $strSize$strLabel" -ForegroundColor White
+            $intIndex++
+        }
+        
+        Write-Host ""
+        Write-Host "To restore from a specific backup, use:" -ForegroundColor Cyan
+        Write-Host "  .\Repair-Cline.ps1 -RestoreOnly -RestoreFrom `"TIMESTAMP`"" -ForegroundColor White
+        Write-Host ""
+    }
+}
+
+function Find-BackupByIdentifier {
+    <#
+    .SYNOPSIS
+        Find a backup by identifier (latest, timestamp, or full path).
+    #>
+    param([Parameter(Mandatory=$true)][string]$strIdentifier)
+    
+    # Check if it's a full path
+    if (Test-Path $strIdentifier) {
+        return $strIdentifier
+    }
+    
+    $arrBackups = Get-AvailableBackups
+    
+    if ($arrBackups.Count -eq 0) {
+        Write-Log -strMessage "No backups found to restore from" -strLevel "ERROR"
+        return $null
+    }
+    
+    # Handle "latest"
+    if ($strIdentifier -eq "latest") {
+        $objLatest = $arrBackups[0]
+        Write-Log -strMessage "Using latest backup: $($objLatest.Timestamp)" -strLevel "INFO"
+        return $objLatest.Path
+    }
+    
+    # Search by timestamp
+    foreach ($objBackup in $arrBackups) {
+        if ($objBackup.Timestamp -eq $strIdentifier -or $objBackup.Name -like "*$strIdentifier*") {
+            Write-Log -strMessage "Found backup: $($objBackup.Name)" -strLevel "INFO"
+            return $objBackup.Path
+        }
+    }
+    
+    Write-Log -strMessage "No backup found matching: $strIdentifier" -strLevel "ERROR"
+    return $null
+}
+
+function Start-RestoreOnlyProcess {
+    <#
+    .SYNOPSIS
+        Perform restore-only operation without reinstalling the extension.
+    #>
+    
+    Write-LogHeader -strTitle "CLINE RESTORE-ONLY MODE v$script:strScriptVersion"
+    
+    if (-not $JsonOutput) {
+        Write-Host ""
+        Write-Host "==============================================================================" -ForegroundColor Cyan
+        Write-Host "                    Cline VS Code Extension Restore Tool                      " -ForegroundColor Cyan
+        Write-Host "                              Version $script:strScriptVersion                           " -ForegroundColor Cyan
+        Write-Host "==============================================================================" -ForegroundColor Cyan
+        Write-Host ""
+    }
+    
+    Write-Log -strMessage "Restore-only mode started" -strLevel "INFO"
+    Write-Log -strMessage "Restore from: $RestoreFrom" -strLevel "INFO"
+    
+    # Find the backup to restore from
+    $strBackupPath = Find-BackupByIdentifier -strIdentifier $RestoreFrom
+    
+    if (-not $strBackupPath) {
+        $script:objJsonResult.status = "failed"
+        $script:objJsonResult.errors += "Backup not found: $RestoreFrom"
+        
+        if ($JsonOutput) {
+            $script:objJsonResult | ConvertTo-Json -Depth 10 | Write-Output
+        }
+        else {
+            Write-Host ""
+            Write-Host "Backup not found: $RestoreFrom" -ForegroundColor Red
+            Write-Host ""
+            Write-Host "Use -ListBackups to see available backups." -ForegroundColor Yellow
+            Write-Host ""
+        }
+        return $false
+    }
+    
+    if (-not $JsonOutput) {
+        Write-Host "Restoring from: $strBackupPath" -ForegroundColor Cyan
+        Write-Host ""
+    }
+    
+    # Perform restore
+    $boolTasksRestored = Restore-ClineTasks -strBackupSource $strBackupPath
+    $boolMCPRestored = Restore-MCPSettings -strBackupSource $strBackupPath
+    $boolRulesRestored = Restore-ClineRules -strBackupSource $strBackupPath
+    
+    # Success message
+    Write-LogHeader -strTitle "RESTORE COMPLETED"
+    
+    $script:objJsonResult.status = "completed"
+    $script:objJsonResult.backupPath = $strBackupPath
+    
+    if ($JsonOutput) {
+        $script:objJsonResult | ConvertTo-Json -Depth 10 | Write-Output
+    }
+    else {
+        Write-Host ""
+        Write-Host "==============================================================================" -ForegroundColor Green
+        Write-Host "                         RESTORE COMPLETED SUCCESSFULLY                        " -ForegroundColor Green
+        Write-Host "==============================================================================" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "Data has been restored from backup!" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "Restored from: $strBackupPath" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "Next Steps:" -ForegroundColor Cyan
+        Write-Host "  1. Restart VS Code if it's running" -ForegroundColor White
+        Write-Host "  2. Verify your tasks and settings are restored" -ForegroundColor White
+        Write-Host ""
+        Write-Host "Log File: $script:strLogFilePath" -ForegroundColor Cyan
+        Write-Host ""
+    }
+    
+    Write-Log -strMessage "Restore-only process completed successfully" -strLevel "SUCCESS"
+    return $true
+}
+
+# ============================================================================
 # MAIN EXECUTION LOGIC
 # ============================================================================
 
@@ -1308,6 +1572,25 @@ function Start-RepairProcess {
 # ============================================================================
 
 try {
+    # Handle ListBackups mode
+    if ($ListBackups) {
+        Show-AvailableBackups
+        exit 0
+    }
+    
+    # Handle RestoreOnly mode
+    if ($RestoreOnly) {
+        $boolSuccess = Start-RestoreOnlyProcess
+        
+        if ($boolSuccess) {
+            exit 0
+        }
+        else {
+            exit 1
+        }
+    }
+    
+    # Default: Full repair process
     $boolSuccess = Start-RepairProcess
     
     if ($boolSuccess) {
