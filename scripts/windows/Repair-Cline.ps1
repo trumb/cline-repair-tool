@@ -1106,14 +1106,19 @@ function Start-RepairProcess {
         exit 1
     }
     
-    # Step 3: Check for running VS Code processes
-    if (-not (Stop-VSCodeProcesses)) {
-        $script:objJsonResult.status = "failed"
-        $script:objJsonResult.errors += "VS Code still running"
-        if ($JsonOutput) { 
-            $script:objJsonResult | ConvertTo-Json -Depth 10 | Write-Output 
+    # Step 3: Check for running VS Code processes (only required for full repair, not backup-only)
+    if (-not $BackupOnly) {
+        if (-not (Stop-VSCodeProcesses)) {
+            $script:objJsonResult.status = "failed"
+            $script:objJsonResult.errors += "VS Code still running"
+            if ($JsonOutput) { 
+                $script:objJsonResult | ConvertTo-Json -Depth 10 | Write-Output 
+            }
+            exit 1
         }
-        exit 1
+    }
+    else {
+        Write-Log -strMessage "Backup-only mode: skipping VS Code process check" -strLevel "INFO"
     }
     
     # Step 4: Create backup
